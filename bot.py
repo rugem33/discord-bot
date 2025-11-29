@@ -1,26 +1,16 @@
 import asyncio
+import os
 import discord
-import yt_dlp as youtube_dl
 from discord.ext import commands
-from dico_token import Token
+from pytubefix import YouTube, Search, Playlist
 
-youtube_dl.utils.bug_reports_message = lambda: ''
-
-ytdl_format_options = {
-    'format': 'bestaudio/best',
-    'noplaylist': True,
-    'quiet': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-}
+# FFmpeg 옵션
 ffmpeg_options = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn',
 }
-ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
 
-
-class YTDLSource(discord.PCMVolumeTransformer):
+class PyTubeSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
         super().__init__(source, volume)
         self.data = data
@@ -28,223 +18,204 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.url = data.get('webpage_url')
 
     @classmethod
-    async def from_query(cls, query, *, loop=None, stream=True):
+    async def from_query(cls, query, *, loop=None):
         loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=not stream))
-        if 'entries' in data:
-            data = data['entries'][0]
-        filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
 
+        def get_info(q):
+            try:
+                if q.startswith('http'):
+                    yt = YouTube(q)
+                else:
+                    s = Search(q)
+                    if not s.results:
+                        raise Exception("검색 결과가 없습니다.")
+                    yt = s.results[0]
+                
+                audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+                if not audio_stream:
+                    raise Exception("오디오 스트림을 찾을 수 없습니다.")
+
+                return {
+                    'title': yt.title,
+                    'url': audio_stream.url,
+                    'webpage_url': yt.watch_url,
+                    'duration': yt.length,
+                    'video_id': yt.video_id
+                }
+            except Exception as e:
+                print(f"Error extracting info: {e}")
+                raise e
+
+        data = await loop.run_in_executor(None, lambda: get_info(query))
+        filename = data['url']
+        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
 
 class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.autoplay_enabled = False
-        self.current_ctx: commands.Context | None = None
-        self.current_url: str | None = None
-        self.current_song_title: str | None = None
-        self.is_playing = False  # 현재 곡 재생 상태
-
-    async def play_song(self, ctx, query):
-        """query(링크/검색어)로 곡을 재생하고 after 콜백에서 자동재생을 이어감"""
-        player = await YTDLSource.from_query(query, loop=self.bot.loop, stream=True)
-        vc = ctx.voice_client
-
-        # 기존 재생 중이면 정지 후 짧게 대기
-        if vc and vc.is_playing():
-            vc.stop()
-            await asyncio.sleep(0.5)
-
-        # 현재 곡 메타데이터 저장
-        self.current_url = player.url
-        self.current_ctx = ctx
-        self.current_song_title = player.title or ''
-        self.is_playing = True
-
-        def after_playing(err):
-            self.is_playing = False
-            if err:
-                print(f"[Error] {err}")
-            if self.autoplay_enabled:
-                asyncio.run_coroutine_threadsafe(self.play_next_song(), self.bot.loop)
-
-        vc.play(player, after=after_playing)
-        await ctx.send(f'Now playing: {player.title}')
-
-    def _pick_next_from_related(self, info_dict: dict) -> str | None:
-        """
-        yt_dlp가 제공하는 related_videos(유튜브의 '다음 추천/관련 영상')에서
-        현재 곡과 다른 첫 번째 후보를 선택하여 URL을 반환.
-        """
-        related = info_dict.get('related_videos') or []
-        if not related:
-            print("[Autoplay] related_videos가 비어 있습니다.")
-            return None
-
-        # 현재 영상의 ID 추출
-        def get_video_id(url: str) -> str | None:
-            # 매우 단순한 추출기 (youtube watch?v=ID 형태 가정)
-            import urllib.parse as up
-            try:
-                qs = up.urlparse(url)
-                if qs.netloc.endswith("youtube.com"):
-                    q = up.parse_qs(qs.query)
-                    return (q.get("v") or [None])[0]
-                if qs.netloc.endswith("youtu.be"):
-                    # /ID 형태
-                    return qs.path.lstrip("/")
-            except Exception:
-                return None
-            return None
-
-        current_id = get_video_id(self.current_url or "")
-
-        for cand in related:
-            # yt_dlp는 각 후보에 id/title 등이 포함됨
-            vid = cand.get('id')
-            if not vid:
-                continue
-            if current_id and vid == current_id:
-                continue
-            # 유튜브 URL 구성
-            return f"https://www.youtube.com/watch?v={vid}"
-
-        return None
-
-    async def play_next_song(self, *, force: bool = False):
-        """
-        현재 곡의 'related_videos'(Up next/관련 영상)에서 다음 곡을 선택해 재생.
-        - force=True 이면 autoplay 상태와 무관하게 동작(수동 스킵 지원)
-        """
-        if not force and not self.autoplay_enabled:
-            return
-        # (콜백 경합 방지) 이미 재생 시작 중이면 종료
-        if self.is_playing:
-            return
-        if not self.current_url or not self.current_ctx:
-            print("다음 곡을 재생할 컨텍스트/URL이 없습니다.")
-            return
-
-        try:
-            # 현재 곡의 전체 정보에서 추천목록 가져오기
-            current_info = ytdl.extract_info(self.current_url, download=False)
-            next_url = self._pick_next_from_related(current_info)
-
-            if not next_url:
-                print("[Autoplay] 추천 영상을 찾지 못해 현재 곡을 다시 재생합니다.")
-                await self.current_ctx.send("추천 영상을 찾지 못해 현재 곡을 다시 재생합니다. 🔂")
-                next_url = self.current_url
-
-            await self.play_song(self.current_ctx, next_url)
-
-        except Exception as e:
-            print(f"[Autoplay] 다음 곡 재생 오류: {e}")
-            import traceback
-            traceback.print_exc()
+        self.current_ctx = None
+        self.autoplay = True
+        self.current_video_id = None
+        self.current_title = None
+        self.queue = [] # 노래 대기열
 
     @commands.command()
     async def join(self, ctx):
         if ctx.author.voice:
             channel = ctx.author.voice.channel
+            if ctx.voice_client is not None:
+                return await ctx.voice_client.move_to(channel)
             await channel.connect()
         else:
-            await ctx.send("음성 채널에 먼저 접속해주세요.")
+            await ctx.send("음성 채널에 먼저 입장해주세요.")
 
     @commands.command()
     async def play(self, ctx, *, query):
-        """(원래 코드와 호환) play도 자동재생을 켭니다."""
-        self.autoplay_enabled = True
-        await self.ensure_voice(ctx)
-        await self.play_song(ctx, query)
-
-    @commands.command()
-    async def autoplay(self, ctx, *, query):
-        """
-        자동재생 모드 시작: 첫 곡만 재생하고
-        이후는 after 콜백 → play_next_song()이 이어서 처리
-        """
-        self.autoplay_enabled = True
-        await self.ensure_voice(ctx)
-        await self.play_song(ctx, query)
-        await ctx.send("🎶 자동 재생 모드가 켜졌습니다!")
-
-    @commands.command(aliases=["skip", "next"])
-    async def nextsong(self, ctx):
-        """
-        ⏭ 다음 곡으로 즉시 넘기기.
-        - 자동재생이 켜져 있으면 stop() → after 콜백이 추천 기반 다음 곡 재생
-        - 자동재생이 꺼져 있어도 강제로 추천을 찾아 재생 (force=True)
-        """
+        """URL이나 검색어로 음악을 재생합니다. 플레이리스트 URL도 지원합니다."""
         if not ctx.voice_client:
-            await ctx.send("먼저 음성 채널에 들어가서 곡을 재생해 주세요.")
+            await self.join(ctx)
+            if not ctx.voice_client:
+                return
+
+        self.current_ctx = ctx
+
+        # 플레이리스트 처리
+        if 'list=' in query and 'http' in query:
+            try:
+                p = Playlist(query)
+                # pytube Playlist는 video_urls를 제공함
+                await ctx.send(f"플레이리스트 **{p.title}**에서 곡을 불러오는 중입니다...")
+                
+                # video_urls는 generator일 수 있으므로 리스트로 변환하거나 순회
+                # pytubefix의 Playlist 동작 확인 필요하지만 보통 video_urls 속성 사용
+                urls = p.video_urls
+                count = 0
+                for url in urls:
+                    self.queue.append(url)
+                    count += 1
+                
+                await ctx.send(f"총 {count}곡이 대기열에 추가되었습니다.")
+                
+                if not ctx.voice_client.is_playing():
+                    await self.play_next_in_queue()
+                return
+            except Exception as e:
+                print(f"Playlist error: {e}")
+                await ctx.send("플레이리스트를 불러오는 중 오류가 발생했습니다. 일반 검색으로 시도합니다.")
+
+        # 일반 단일 곡 처리
+        self.queue.append(query)
+        if not ctx.voice_client.is_playing():
+            await self.play_next_in_queue()
+        else:
+            await ctx.send(f"대기열에 추가됨: {query}")
+
+    async def play_next_in_queue(self):
+        if not self.queue:
+            # 대기열이 비었으면 자동재생 시도
+            if self.autoplay and self.current_video_id:
+                 await self.play_autoplay()
             return
 
-        await ctx.send("⏭ 다음 곡으로 넘어갑니다.")
-        was_autoplay = self.autoplay_enabled
+        query = self.queue.pop(0)
+        
+        try:
+            player = await PyTubeSource.from_query(query, loop=self.bot.loop)
+            
+            if self.current_ctx.voice_client.is_playing():
+                self.current_ctx.voice_client.stop()
+            
+            self.current_title = player.title
+            self.current_video_id = player.data.get('video_id')
 
-        # 재생 중이면 즉시 정지 (after 콜백이 트리거됨)
-        if ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
+            self.current_ctx.voice_client.play(player, after=self.after_playing)
+            await self.current_ctx.send(f'Now playing: **{player.title}**')
+        except Exception as e:
+            await self.current_ctx.send(f"재생 오류 ({query}): {e}")
+            # 오류 발생 시 다음 곡 시도
+            await self.play_next_in_queue()
 
-        # 자동재생이 꺼져 있으면 추천 기반으로 수동 탐색
-        if not was_autoplay:
-            await self.play_next_song(force=True)
+    def after_playing(self, error):
+        if error:
+            print(f'Player error: {error}')
+        
+        # 다음 곡 재생 (대기열 -> 자동재생 순)
+        asyncio.run_coroutine_threadsafe(self.play_next_in_queue(), self.bot.loop)
 
-    @commands.command()
-    async def stopautoplay(self, ctx):
-        self.autoplay_enabled = False
-        await ctx.send("🔇 자동 재생이 중단되었습니다.")
+    async def play_autoplay(self):
+        print("Autoplay triggered")
+        next_url = await self.get_recommendation(self.current_title, self.current_video_id)
+        if next_url:
+            print(f"Autoplay URL: {next_url}")
+            # 자동재생 곡을 대기열 맨 앞에 추가하고 재생
+            self.queue.insert(0, next_url)
+            await self.play_next_in_queue()
+        else:
+            await self.current_ctx.send("자동재생 곡을 찾을 수 없습니다.")
+
+    async def get_recommendation(self, title, current_video_id):
+        def _search():
+            try:
+                search_query = title
+                s = Search(search_query)
+                if not s.results:
+                    import time
+                    time.sleep(1)
+                    s = Search(search_query)
+                
+                if not s.results:
+                    return None
+
+                for vid in s.results:
+                    if vid.video_id != current_video_id:
+                        return vid.watch_url
+                return None
+            except Exception as e:
+                print(f"Recommendation error: {e}")
+                return None
+        
+        return await self.bot.loop.run_in_executor(None, _search)
 
     @commands.command()
     async def stop(self, ctx):
-        self.autoplay_enabled = False
+        self.queue.clear() # 대기열 초기화
         if ctx.voice_client:
+            ctx.voice_client.stop()
             await ctx.voice_client.disconnect()
+            await ctx.send("재생을 멈추고 채널을 떠났습니다.")
 
     @commands.command()
-    async def pause(self, ctx):
+    async def skip(self, ctx):
+        """현재 곡을 스킵합니다."""
         if ctx.voice_client and ctx.voice_client.is_playing():
-            ctx.voice_client.pause()
-            await ctx.send("⏸ 음악 일시 정지")
-
-    @commands.command()
-    async def resume(self, ctx):
-        if ctx.voice_client and ctx.voice_client.is_paused():
-            ctx.voice_client.resume()
-            await ctx.send("▶️ 음악 다시 재생")
+            ctx.voice_client.stop()
+            await ctx.send("스킵됨.")
 
     @commands.command()
     async def volume(self, ctx, volume: int):
-        if ctx.voice_client and ctx.voice_client.source:
-            ctx.voice_client.source.volume = volume / 100
-            await ctx.send(f"🔊 볼륨: {volume}%")
+        if ctx.voice_client is None:
+            return await ctx.send("음성 채널에 연결되어 있지 않습니다.")
+        ctx.voice_client.source.volume = volume / 100
+        await ctx.send(f"볼륨을 {volume}%로 설정했습니다.")
 
+    @play.before_invoke
     async def ensure_voice(self, ctx):
         if ctx.voice_client is None:
             if ctx.author.voice:
                 await ctx.author.voice.channel.connect()
             else:
-                await ctx.send("음성 채널에 먼저 접속해주세요.")
+                await ctx.send("음성 채널에 연결되어 있지 않습니다.")
                 raise commands.CommandError("Author not connected to a voice channel.")
-        elif ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
-
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=intents)
-
+bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    print('------')
+    await bot.add_cog(Music(bot))
 
-
-async def main():
-    async with bot:
-        await bot.add_cog(Music(bot))
-        await bot.start(Token)
-
-asyncio.run(main())
+bot.run(os.getenv('DISCORD_TOKEN'))
