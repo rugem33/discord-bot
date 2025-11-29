@@ -84,31 +84,40 @@ class Music(commands.Cog):
             # music.youtube.com 호환성 처리
             query = query.replace('music.youtube.com', 'www.youtube.com')
             
-            try:
-                p = Playlist(query)
-                # pytube Playlist는 video_urls를 제공함
-                await ctx.send(f"플레이리스트 **{p.title}**에서 곡을 불러오는 중입니다...")
-                
-                # video_urls는 generator일 수 있으므로 리스트로 변환하거나 순회
-                # pytubefix의 Playlist 동작 확인 필요하지만 보통 video_urls 속성 사용
-                urls = p.video_urls
-                count = 0
-                limit = 30 # 대기열 폭탄 방지
-                
-                for url in urls:
-                    self.queue.append(url)
-                    count += 1
-                    if count >= limit:
-                        break
-                
-                await ctx.send(f"총 {count}곡이 대기열에 추가되었습니다." + (" (최대 30곡)" if count == limit else ""))
-                
-                if not ctx.voice_client.is_playing():
-                    await self.play_next_in_queue()
-                return
-            except Exception as e:
-                print(f"Playlist error: {e}")
-                await ctx.send("플레이리스트를 불러오는 중 오류가 발생했습니다. 일반 검색으로 시도합니다.")
+            await ctx.send(f"플레이리스트 정보를 분석 중입니다...")
+
+            def get_playlist_info(url):
+                try:
+                    p = Playlist(url)
+                    # title 접근이나 video_urls 접근 시 네트워크 요청 발생 가능
+                    title = p.title
+                    # video_urls는 전체를 가져올 수 있으므로 주의. 
+                    # executor에서 실행하므로 봇은 멈추지 않음.
+                    urls = list(p.video_urls[:30])
+                    return title, urls
+                except Exception as e:
+                    print(f"Playlist error: {e}")
+                    return None, []
+
+            title, urls = await self.bot.loop.run_in_executor(None, lambda: get_playlist_info(query))
+
+            if not title and not urls:
+                 await ctx.send("플레이리스트를 불러오는 중 오류가 발생했습니다.")
+                 return
+
+            if title:
+                await ctx.send(f"플레이리스트 **{title}**에서 곡을 불러왔습니다.")
+            
+            count = 0
+            for url in urls:
+                self.queue.append(url)
+                count += 1
+            
+            await ctx.send(f"총 {count}곡이 대기열에 추가되었습니다. (최대 30곡)")
+            
+            if not ctx.voice_client.is_playing():
+                await self.play_next_in_queue()
+            return
 
         # 일반 단일 곡 처리
         self.queue.append(query)
