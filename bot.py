@@ -24,9 +24,9 @@ class PyTubeSource(discord.PCMVolumeTransformer):
         def get_info(q):
             try:
                 if q.startswith('http'):
-                    yt = YouTube(q)
+                    yt = YouTube(q, client='WEB')
                 else:
-                    s = Search(q)
+                    s = Search(q, client='WEB')
                     if not s.results:
                         raise Exception("검색 결과가 없습니다.")
                     yt = s.results[0]
@@ -88,12 +88,16 @@ class Music(commands.Cog):
 
             def get_playlist_info(url):
                 try:
-                    p = Playlist(url)
+                    p = Playlist(url, client='WEB')
                     # title 접근이나 video_urls 접근 시 네트워크 요청 발생 가능
                     title = p.title
                     # video_urls는 전체를 가져올 수 있으므로 주의. 
                     # executor에서 실행하므로 봇은 멈추지 않음.
-                    urls = list(p.video_urls[:30])
+                    urls = []
+                    for video_url in p.video_urls:
+                        urls.append(video_url)
+                        if len(urls) >= 30:
+                            break
                     return title, urls
                 except Exception as e:
                     print(f"Playlist error: {e}")
