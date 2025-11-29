@@ -81,6 +81,9 @@ class Music(commands.Cog):
 
         # 플레이리스트 처리
         if 'list=' in query and 'http' in query and 'watch?v=' not in query:
+            # music.youtube.com 호환성 처리
+            query = query.replace('music.youtube.com', 'www.youtube.com')
+            
             try:
                 p = Playlist(query)
                 # pytube Playlist는 video_urls를 제공함
@@ -90,11 +93,15 @@ class Music(commands.Cog):
                 # pytubefix의 Playlist 동작 확인 필요하지만 보통 video_urls 속성 사용
                 urls = p.video_urls
                 count = 0
+                limit = 30 # 대기열 폭탄 방지
+                
                 for url in urls:
                     self.queue.append(url)
                     count += 1
+                    if count >= limit:
+                        break
                 
-                await ctx.send(f"총 {count}곡이 대기열에 추가되었습니다.")
+                await ctx.send(f"총 {count}곡이 대기열에 추가되었습니다." + (" (최대 30곡)" if count == limit else ""))
                 
                 if not ctx.voice_client.is_playing():
                     await self.play_next_in_queue()
