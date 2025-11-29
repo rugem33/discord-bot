@@ -29,24 +29,24 @@ class PyTubeSource(discord.PCMVolumeTransformer):
         loop = loop or asyncio.get_event_loop()
 
         def get_info(q):
+            # 공통 설정
+            base_kwargs = {
+                'use_oauth': True,
+                'allow_oauth_cache': True
+            }
+            po_token = os.getenv('PO_TOKEN')
+            if po_token:
+                base_kwargs['po_token'] = po_token
+            
+            # 1. WEB 클라이언트로 시도 (OAuth 사용)
             try:
-                # OAuth 및 PO_TOKEN 설정
-                kwargs = {
-                    'use_oauth': True,
-                    'allow_oauth_cache': True
-                }
-                po_token = os.getenv('PO_TOKEN')
-                if po_token:
-                    kwargs['po_token'] = po_token
-
                 if q.startswith('http'):
-                    yt = YouTube(q, **kwargs)
+                    yt = YouTube(q, client='WEB', **base_kwargs)
                 else:
                     s = Search(q, client='WEB')
                     if not s.results:
                         raise Exception("검색 결과가 없습니다.")
-                    # 검색 결과의 URL로 YouTube 객체 생성 (OAuth 적용)
-                    yt = YouTube(s.results[0].watch_url, **kwargs)
+                    yt = YouTube(s.results[0].watch_url, client='WEB', **base_kwargs)
                 
                 audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
                 if not audio_stream:
@@ -60,8 +60,31 @@ class PyTubeSource(discord.PCMVolumeTransformer):
                     'video_id': yt.video_id
                 }
             except Exception as e:
-                print(f"Error extracting info: {e}")
-                raise e
+                # 428 오류 등 발생 시 ANDROID 클라이언트로 재시도 (OAuth 제외)
+                print(f"WEB client failed: {e}. Retrying with ANDROID client...")
+                try:
+                    if q.startswith('http'):
+                        yt = YouTube(q, client='ANDROID')
+                    else:
+                        s = Search(q, client='ANDROID')
+                        if not s.results:
+                            raise Exception("검색 결과가 없습니다.")
+                        yt = YouTube(s.results[0].watch_url, client='ANDROID')
+                    
+                    audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+                    if not audio_stream:
+                        raise Exception("오디오 스트림을 찾을 수 없습니다.")
+                        
+                    return {
+                        'title': yt.title,
+                        'url': audio_stream.url,
+                        'webpage_url': yt.watch_url,
+                        'duration': yt.length,
+                        'video_id': yt.video_id
+                    }
+                except Exception as final_e:
+                    print(f"Error extracting info: {final_e}")
+                    raise final_e
 
         data = await loop.run_in_executor(None, lambda: get_info(query))
         filename = data['url']
