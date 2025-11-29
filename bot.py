@@ -1,8 +1,15 @@
 import asyncio
 import os
 import discord
+import builtins
 from discord.ext import commands
 from pytubefix import YouTube, Search, Playlist
+
+# 시스템 환경(서비스 등)에서 input() 호출 시 EOFError 방지
+def safe_input(prompt=''):
+    print(f"[System] Input requested: {prompt}. Skipping wait (Non-interactive mode).")
+    return ""
+builtins.input = safe_input
 
 # FFmpeg 옵션
 ffmpeg_options = {
