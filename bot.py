@@ -80,7 +80,7 @@ class Music(commands.Cog):
         self.current_ctx = ctx
 
         # 플레이리스트 처리
-        if 'list=' in query and 'http' in query:
+        if 'list=' in query and 'http' in query and 'watch?v=' not in query:
             try:
                 p = Playlist(query)
                 # pytube Playlist는 video_urls를 제공함
