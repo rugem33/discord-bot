@@ -23,13 +23,23 @@ class PyTubeSource(discord.PCMVolumeTransformer):
 
         def get_info(q):
             try:
+                # OAuth 및 PO_TOKEN 설정
+                kwargs = {
+                    'use_oauth': True,
+                    'allow_oauth_cache': True
+                }
+                po_token = os.getenv('PO_TOKEN')
+                if po_token:
+                    kwargs['po_token'] = po_token
+
                 if q.startswith('http'):
-                    yt = YouTube(q, client='WEB')
+                    yt = YouTube(q, **kwargs)
                 else:
                     s = Search(q, client='WEB')
                     if not s.results:
                         raise Exception("검색 결과가 없습니다.")
-                    yt = s.results[0]
+                    # 검색 결과의 URL로 YouTube 객체 생성 (OAuth 적용)
+                    yt = YouTube(s.results[0].watch_url, **kwargs)
                 
                 audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
                 if not audio_stream:
@@ -88,7 +98,16 @@ class Music(commands.Cog):
 
             def get_playlist_info(url):
                 try:
-                    p = Playlist(url, client='WEB')
+                    # OAuth 및 PO_TOKEN 설정
+                    kwargs = {
+                        'use_oauth': True,
+                        'allow_oauth_cache': True
+                    }
+                    po_token = os.getenv('PO_TOKEN')
+                    if po_token:
+                        kwargs['po_token'] = po_token
+
+                    p = Playlist(url, client='WEB', **kwargs)
                     # title 접근이나 video_urls 접근 시 네트워크 요청 발생 가능
                     title = p.title
                     # video_urls는 전체를 가져올 수 있으므로 주의. 
